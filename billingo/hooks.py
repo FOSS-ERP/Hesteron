@@ -306,3 +306,8 @@ require_type_annotated_api_methods = True
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
 
+doc_events = {
+    "Sales Invoice": {
+        "on_submit": "billingo.api.create_billingo_invoice"
+    }
+}
