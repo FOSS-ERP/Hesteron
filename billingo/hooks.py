@@ -308,6 +308,8 @@ require_type_annotated_api_methods = True
 
 doc_events = {
     "Sales Invoice": {
-        "on_submit": "billingo.api.create_billingo_invoice"
+        "after_insert": "billingo.api.sync_billingo_draft",
+        "on_update": "billingo.api.sync_billingo_draft",
+        "on_submit": "billingo.api.finalize_billingo_invoice",
     }
 }
