@@ -17,6 +17,8 @@ Flow:
          numbered invoice in place - no new Billingo document id.
 """
 
+import json
+
 import frappe
 import requests
 
@@ -45,6 +47,12 @@ BANK_ACCOUNT_ID_BY_CURRENCY = {
     "USD": 294227,  # Billingo bank account: IbanFirst USD
 }
 
+# This is deliberately a site setting, rather than a source-code constant:
+# document blocks belong to a Billingo profile, just like partners and bank
+# accounts.  Set it with:
+#   bench --site <site> set-config billingo_document_block_id <block-id>
+DOCUMENT_BLOCK_CONFIG_KEY = "billingo_document_block_id"
+
 
 def _get_headers():
     api_key = frappe.conf.get("billingo_api_key")
@@ -63,26 +71,110 @@ def _get_error_text(response):
         if isinstance(data, dict):
             error = data.get("error")
             if isinstance(error, dict) and error.get("message"):
-                return str(error["message"])
+                # Billingo puts useful validation information in sibling
+                # fields (notably ``errors``).  Preserve the complete API
+                # response instead of reducing it to "Validation Failed".
+                return json.dumps(data, ensure_ascii=False, default=str)
             if data.get("message"):
-                return str(data["message"])
+                return json.dumps(data, ensure_ascii=False, default=str)
+            return json.dumps(data, ensure_ascii=False, default=str)
     except Exception:
         pass
     return response.text or "Unknown Billingo error"
 
 
 # ----------------------------------------------------------------------
-# Partner / customer (unchanged from the working version)
+# Partner / customer
 # ----------------------------------------------------------------------
+
+def _get_document_block_id():
+    """Return the Billingo invoice block configured for this Frappe site."""
+    block_id = frappe.conf.get(DOCUMENT_BLOCK_CONFIG_KEY)
+    if block_id in (None, ""):
+        frappe.throw(
+            f"{DOCUMENT_BLOCK_CONFIG_KEY} is not set in site_config.json. "
+            "Configure a valid Billingo invoice document-block ID before syncing."
+        )
+
+    try:
+        block_id = int(block_id)
+    except (TypeError, ValueError):
+        frappe.throw(f"{DOCUMENT_BLOCK_CONFIG_KEY} must be a positive integer.")
+
+    if block_id <= 0:
+        frappe.throw(f"{DOCUMENT_BLOCK_CONFIG_KEY} must be a positive integer.")
+    return block_id
+
+
+def _clear_partner_id(customer_name):
+    frappe.db.set_value("Customer", customer_name, "custom_billingo_partner_id", None)
+
+
+def _stored_partner_is_accessible(partner_id):
+    """Check the stored profile-scoped partner ID against the current key."""
+    response = requests.get(
+        f"{BILLINGO_BASE_URL}/partners/{partner_id}",
+        headers=_get_headers(),
+        timeout=15,
+    )
+    if response.ok:
+        return True
+    if response.status_code in (403, 404):
+        return False
+    response.raise_for_status()
+    return False
+
+
+def _find_existing_partner(customer):
+    """Reuse an exact-name partner in the active Billingo profile if present."""
+    response = requests.get(
+        f"{BILLINGO_BASE_URL}/partners",
+        params={"query": customer.customer_name, "per_page": 100},
+        headers=_get_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+
+    for partner in response.json().get("data", []):
+        if (partner.get("name") or "").strip().casefold() == customer.customer_name.strip().casefold():
+            return partner.get("id")
+    return None
+
+
+def _get_required_customer_address(customer_name):
+    address_line, city, postal_code, country_code = _get_customer_address(customer_name)
+    values = {
+        "street address": address_line,
+        "city": city,
+        "postal code": postal_code,
+    }
+    missing = [label for label, value in values.items() if not value]
+    if missing:
+        frappe.throw(
+            f"Cannot create a Billingo partner for Customer '{customer_name}': "
+            f"missing {', '.join(missing)} on its linked Address."
+        )
+    return address_line, city, postal_code, country_code or "HU"
 
 def _get_or_create_partner(customer_name):
     customer = frappe.get_doc("Customer", customer_name)
 
     existing_id = customer.get("custom_billingo_partner_id")
     if existing_id:
-        return existing_id
+        if _stored_partner_is_accessible(existing_id):
+            return existing_id
 
-    address_line, city, postal_code, country_code = _get_customer_address(customer_name)
+        # IDs are only valid in the Billingo profile that created them.  A
+        # changed API key can therefore make an otherwise valid Customer
+        # record unusable.  Clear it and recover under the active profile.
+        _clear_partner_id(customer_name)
+
+    partner_id = _find_existing_partner(customer)
+    if partner_id:
+        frappe.db.set_value("Customer", customer_name, "custom_billingo_partner_id", partner_id)
+        return partner_id
+
+    address_line, city, postal_code, country_code = _get_required_customer_address(customer_name)
     email = _get_customer_email(customer_name)
 
     payload = {
@@ -107,7 +199,6 @@ def _get_or_create_partner(customer_name):
     partner_id = response.json()["id"]
 
     frappe.db.set_value("Customer", customer_name, "custom_billingo_partner_id", partner_id)
-    frappe.db.commit()
     return partner_id
 
 
@@ -369,7 +460,7 @@ def _get_bank_account_id(doc):
 def _build_billingo_payload(doc, partner_id, doc_type):
     payload = {
         "partner_id": partner_id,
-        "block_id": 0,
+        "block_id": _get_document_block_id(),
         "type": doc_type,          # "draft" while ERPNext is Draft, "invoice" on submit
         "fulfillment_date": str(doc.posting_date),
         "due_date": str(doc.due_date or doc.posting_date),
@@ -390,6 +481,32 @@ def _build_billingo_payload(doc, partner_id, doc_type):
     return payload
 
 
+def _build_modification_payload(doc):
+    """Payload accepted by Billingo's linked credit-note endpoint."""
+    return {
+        "due_date": str(doc.due_date or doc.posting_date),
+        "payment_method": _map_payment_method(doc),
+        "without_financial_fulfillment": False,
+        "items": _map_items(doc),
+        "comment": _build_comment(doc),
+    }
+
+
+def _record_draft_error(doc, error_detail):
+    doc.db_set("custom_billingo_sync_status", "Failed")
+    doc.db_set("custom_billingo_error", error_detail[:500])
+    frappe.log_error(error_detail, "Billingo Draft Sync Error")
+
+
+def _raise_finalization_error(doc, error_detail):
+    """Log the remote error and abort the ERPNext submit transaction."""
+    frappe.log_error(error_detail, "Billingo Finalization Error")
+    frappe.throw(
+        f"Billingo finalization failed for Sales Invoice {doc.name}: {error_detail}",
+        title="Billingo finalization failed",
+    )
+
+
 # ----------------------------------------------------------------------
 # Draft push (ERPNext Draft -> Billingo draft)
 # ----------------------------------------------------------------------
@@ -402,6 +519,10 @@ def sync_billingo_draft(doc, method=None):
     if doc.docstatus != 0:
         return
     if not doc.customer:
+        return
+    if doc.is_return:
+        # Billingo returns are linked to their submitted originals and cannot
+        # be independent negative drafts.
         return
 
     try:
@@ -439,13 +560,10 @@ def sync_billingo_draft(doc, method=None):
 
     except requests.exceptions.HTTPError as e:
         error_detail = _get_error_text(e.response) if e.response is not None else str(e)
-        doc.db_set("custom_billingo_sync_status", "Failed")
-        doc.db_set("custom_billingo_error", error_detail[:500])
-        frappe.log_error(error_detail, "Billingo Draft Sync Error")
+        _record_draft_error(doc, error_detail)
 
     except Exception as e:
-        doc.db_set("custom_billingo_sync_status", "Failed")
-        doc.db_set("custom_billingo_error", str(e)[:500])
+        _record_draft_error(doc, str(e))
         frappe.log_error(frappe.get_traceback(), "Billingo Draft Sync Error")
 
 
@@ -458,18 +576,20 @@ def finalize_billingo_invoice(doc, method=None):
     doc_events hook: Sales Invoice on_submit.
     Converts the existing Billingo draft into a real invoice in place.
     """
-    billingo_id = doc.get("custom_billingo_document_id")
-
-    if not billingo_id:
-        # No draft was ever pushed (e.g. customer was blank while in
-        # Draft) - fall back to creating a fresh invoice directly.
-        try:
-            partner_id = _get_or_create_partner(doc.customer)
-            payload = _build_billingo_payload(doc, partner_id, "invoice")
+    try:
+        if doc.is_return:
+            original_billingo_id = frappe.db.get_value(
+                "Sales Invoice", doc.return_against, "custom_billingo_document_id"
+            )
+            if not original_billingo_id:
+                frappe.throw(
+                    f"Cannot create a Billingo credit note for {doc.name}: the original "
+                    f"Sales Invoice {doc.return_against or '(missing)'} has no Billingo document ID."
+                )
 
             response = requests.post(
-                f"{BILLINGO_BASE_URL}/documents",
-                json=payload,
+                f"{BILLINGO_BASE_URL}/documents/{original_billingo_id}/create-modification-document",
+                json=_build_modification_payload(doc),
                 headers=_get_headers(),
                 timeout=20,
             )
@@ -482,45 +602,40 @@ def finalize_billingo_invoice(doc, method=None):
             doc.db_set("custom_billingo_error", "")
             return
 
-        except requests.exceptions.HTTPError as e:
-            error_detail = _get_error_text(e.response) if e.response is not None else str(e)
-            doc.db_set("custom_billingo_sync_status", "Failed")
-            doc.db_set("custom_billingo_error", error_detail[:500])
-            frappe.log_error(error_detail, "Billingo Finalization Error")
-            return
-
-        except Exception as e:
-            doc.db_set("custom_billingo_sync_status", "Failed")
-            doc.db_set("custom_billingo_error", str(e)[:500])
-            frappe.log_error(frappe.get_traceback(), "Billingo Finalization Error")
-            return
-
-    try:
+        billingo_id = doc.get("custom_billingo_document_id")
         partner_id = _get_or_create_partner(doc.customer)
         payload = _build_billingo_payload(doc, partner_id, "invoice")
 
-        # PUT /documents/{id} converts the draft into an invoice -
-        # same Billingo id, now finalized and numbered.
-        response = requests.put(
-            f"{BILLINGO_BASE_URL}/documents/{billingo_id}",
-            json=payload,
-            headers=_get_headers(),
-            timeout=20,
-        )
+        if billingo_id:
+            # PUT /documents/{id} converts the draft into an invoice -
+            # same Billingo id, now finalized and numbered.
+            response = requests.put(
+                f"{BILLINGO_BASE_URL}/documents/{billingo_id}",
+                json=payload,
+                headers=_get_headers(),
+                timeout=20,
+            )
+        else:
+            # No draft was pushed (for example, the invoice was imported),
+            # so create a real invoice directly.
+            response = requests.post(
+                f"{BILLINGO_BASE_URL}/documents",
+                json=payload,
+                headers=_get_headers(),
+                timeout=20,
+            )
         response.raise_for_status()
         result = response.json()
 
+        if not billingo_id:
+            doc.db_set("custom_billingo_document_id", result.get("id"))
         doc.db_set("custom_billingo_invoice_number", result.get("invoice_number"))
         doc.db_set("custom_billingo_sync_status", "Synced")
         doc.db_set("custom_billingo_error", "")
 
     except requests.exceptions.HTTPError as e:
         error_detail = _get_error_text(e.response) if e.response is not None else str(e)
-        doc.db_set("custom_billingo_sync_status", "Failed")
-        doc.db_set("custom_billingo_error", error_detail[:500])
-        frappe.log_error(error_detail, "Billingo Finalization Error")
+        _raise_finalization_error(doc, error_detail)
 
     except Exception as e:
-        doc.db_set("custom_billingo_sync_status", "Failed")
-        doc.db_set("custom_billingo_error", str(e)[:500])
-        frappe.log_error(frappe.get_traceback(), "Billingo Finalization Error")
+        _raise_finalization_error(doc, f"{e}\n\n{frappe.get_traceback()}")
