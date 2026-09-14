@@ -25,6 +25,7 @@ import requests
 BILLINGO_BASE_URL = "https://api.billingo.hu/v3"
 
 DEFAULT_PAYMENT_METHOD = "wire_transfer"
+DEFAULT_DOCUMENT_LANGUAGE = "hu"
 
 MODE_OF_PAYMENT_MAP = {
     "Cash": "cash",
@@ -39,10 +40,9 @@ MODE_OF_PAYMENT_MAP = {
 
 # Billingo bank_account_id values are specific to the Hesteron Kft. live
 # Billingo account (Profil azonosito: 190-191) - do not reuse against the
-# test/sandbox Billingo account, its ids differ. HUF (and any unmapped
-# currency) is intentionally left unset, so Billingo's own account-level
-# default bank account applies (currently BinX HUF, id 284393).
+# test/sandbox Billingo account, its IDs differ.
 BANK_ACCOUNT_ID_BY_CURRENCY = {
+    "HUF": 284393,  # Billingo bank account: BinX HUF
     "EUR": 280724,  # Billingo bank account: IbanFirst EUR
     "USD": 294227,  # Billingo bank account: IbanFirst USD
 }
@@ -253,6 +253,7 @@ def _get_flat_charge_rows(sales_invoice):
 
 def _map_extra_charges(sales_invoice):
     is_hungarian = _get_invoice_language(sales_invoice) == "hu"
+    vat_rate = _map_vat_rate(sales_invoice)
     comment = (
         "Automatikusan hozzáadva a Sales Invoice adók táblából (tételes díj)"
         if is_hungarian
@@ -266,7 +267,10 @@ def _map_extra_charges(sales_invoice):
             "unit_price_type": "net",
             "quantity": 1,
             "unit": "pcs",
-            "vat": "0%",
+            # ERPNext's actual tax rows are commonly used for shipping.
+            # They must use the invoice's VAT rate, not become an exempt
+            # Billingo line item.
+            "vat": vat_rate,
             "comment": comment,
         })
     return extra_items
@@ -442,22 +446,26 @@ def _build_comment(doc):
 
 def _get_invoice_language(doc):
     """
-    Determines which language Billingo should render the invoice in.
-    Driven by the standard ERPNext Customer.language field.
-    Default is Hungarian; only an explicit "en" on the Customer
-    switches the invoice to English.
+    Determines the Billingo document language. Hesteron's invoices are
+    Hungarian by default; an optional site setting can override this for the
+    whole site without relying on individual Customer.language values.
     """
-    customer_language = frappe.db.get_value("Customer", doc.customer, "language")
-    if customer_language == "en":
-        return "en"
-    return "hu"
+    language = str(frappe.conf.get("billingo_document_language", DEFAULT_DOCUMENT_LANGUAGE)).lower()
+    supported_languages = {"de", "en", "fr", "hr", "hu", "it", "ro", "sk", "us"}
+    if language in supported_languages:
+        return language
+    frappe.log_error(
+        f"Unsupported billingo_document_language '{language}'; using Hungarian.",
+        "Billingo Language Configuration",
+    )
+    return DEFAULT_DOCUMENT_LANGUAGE
 
 
 def _get_bank_account_id(doc):
     """
     Returns the Billingo bank_account_id to attach for non-HUF invoices.
-    HUF (and any other unmapped currency) is left unset, so Billingo's own
-    account-level default bank account applies (currently BinX HUF).
+    HUF, EUR and USD use the Hesteron live-account bank accounts selected by
+    the business. Any other currency falls back to Billingo's account default.
     """
     bank_account_id = BANK_ACCOUNT_ID_BY_CURRENCY.get(doc.currency)
     if not bank_account_id and doc.currency and doc.currency != "HUF":
@@ -484,7 +492,9 @@ def _build_billingo_payload(doc, partner_id, doc_type):
         "language": _get_invoice_language(doc),
         "currency": doc.currency or "EUR",
         "conversion_rate": doc.conversion_rate or 1,
-        "electronic": False,
+        # Enables Billingo's own invoice-delivery option ("Küldés Billingón
+        # keresztül") for the electronic document.
+        "electronic": True,
         "paid": False,
         "items": _map_items(doc),
         "comment": _build_comment(doc),
