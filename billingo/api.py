@@ -106,6 +106,19 @@ def _get_document_block_id():
     return block_id
 
 
+def _get_document_by_vendor_id(vendor_id):
+    """Return a previously created Billingo document for an ERPNext reference."""
+    response = requests.get(
+        f"{BILLINGO_BASE_URL}/documents/vendor/{vendor_id}",
+        headers=_get_headers(),
+        timeout=15,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json()
+
+
 def _clear_partner_id(customer_name):
     frappe.db.set_value("Customer", customer_name, "custom_billingo_partner_id", None)
 
@@ -459,6 +472,9 @@ def _get_bank_account_id(doc):
 
 def _build_billingo_payload(doc, partner_id, doc_type):
     payload = {
+        # Makes retries idempotent when Billingo created a document but the
+        # HTTP response did not reach ERPNext.
+        "vendor_id": doc.name,
         "partner_id": partner_id,
         "block_id": _get_document_block_id(),
         "type": doc_type,          # "draft" while ERPNext is Draft, "invoice" on submit
@@ -505,6 +521,13 @@ def _raise_finalization_error(doc, error_detail):
         f"Billingo finalization failed for Sales Invoice {doc.name}: {error_detail}",
         title="Billingo finalization failed",
     )
+
+
+def _mark_document_synced(doc, result):
+    doc.db_set("custom_billingo_document_id", result.get("id"))
+    doc.db_set("custom_billingo_invoice_number", result.get("invoice_number"))
+    doc.db_set("custom_billingo_sync_status", "Synced")
+    doc.db_set("custom_billingo_error", "")
 
 
 # ----------------------------------------------------------------------
@@ -618,6 +641,10 @@ def finalize_billingo_invoice(doc, method=None):
         else:
             # No draft was pushed (for example, the invoice was imported),
             # so create a real invoice directly.
+            existing_document = _get_document_by_vendor_id(doc.name)
+            if existing_document:
+                _mark_document_synced(doc, existing_document)
+                return
             response = requests.post(
                 f"{BILLINGO_BASE_URL}/documents",
                 json=payload,
@@ -627,11 +654,7 @@ def finalize_billingo_invoice(doc, method=None):
         response.raise_for_status()
         result = response.json()
 
-        if not billingo_id:
-            doc.db_set("custom_billingo_document_id", result.get("id"))
-        doc.db_set("custom_billingo_invoice_number", result.get("invoice_number"))
-        doc.db_set("custom_billingo_sync_status", "Synced")
-        doc.db_set("custom_billingo_error", "")
+        _mark_document_synced(doc, result)
 
     except requests.exceptions.HTTPError as e:
         error_detail = _get_error_text(e.response) if e.response is not None else str(e)
@@ -639,3 +662,21 @@ def finalize_billingo_invoice(doc, method=None):
 
     except Exception as e:
         _raise_finalization_error(doc, f"{e}\n\n{frappe.get_traceback()}")
+
+
+@frappe.whitelist()
+def retry_billingo_sync(sales_invoice: str) -> dict:
+    """Manually retry Billingo finalization for a submitted failed invoice."""
+    doc = frappe.get_doc("Sales Invoice", sales_invoice)
+    doc.check_permission("write")
+
+    if doc.docstatus != 1:
+        frappe.throw("Only submitted Sales Invoices can be retried.")
+    if doc.get("custom_billingo_sync_status") != "Failed":
+        frappe.throw("Billingo retry is only available when the sync status is Failed.")
+
+    finalize_billingo_invoice(doc)
+    return {
+        "document_id": doc.get("custom_billingo_document_id"),
+        "invoice_number": doc.get("custom_billingo_invoice_number"),
+    }
