@@ -540,6 +540,33 @@ def _mark_document_synced(doc, result):
     doc.db_set("custom_billingo_error", "")
 
 
+def _send_document_via_billingo(doc, result):
+    """Ask Billingo to email a finalized document to the ERPNext contact."""
+    document_id = result.get("id")
+    email = _get_customer_email(doc.customer)
+    if not document_id or not email:
+        frappe.log_error(
+            f"Billingo document {document_id or '(unknown)'} for Sales Invoice {doc.name} "
+            "was finalized but not sent: the Customer has no linked contact email.",
+            "Billingo Send Skipped",
+        )
+        return
+
+    try:
+        response = requests.post(
+            f"{BILLINGO_BASE_URL}/documents/{document_id}/send",
+            json={"emails": [email]},
+            headers=_get_headers(),
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        error_detail = _get_error_text(e.response) if e.response is not None else str(e)
+        frappe.log_error(error_detail, "Billingo Send Error")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Billingo Send Error")
+
+
 # ----------------------------------------------------------------------
 # Draft push (ERPNext Draft -> Billingo draft)
 # ----------------------------------------------------------------------
@@ -633,6 +660,7 @@ def finalize_billingo_invoice(doc, method=None):
             doc.db_set("custom_billingo_invoice_number", result.get("invoice_number"))
             doc.db_set("custom_billingo_sync_status", "Synced")
             doc.db_set("custom_billingo_error", "")
+            _send_document_via_billingo(doc, result)
             return
 
         billingo_id = doc.get("custom_billingo_document_id")
@@ -654,6 +682,7 @@ def finalize_billingo_invoice(doc, method=None):
             existing_document = _get_document_by_vendor_id(doc.name)
             if existing_document:
                 _mark_document_synced(doc, existing_document)
+                _send_document_via_billingo(doc, existing_document)
                 return
             response = requests.post(
                 f"{BILLINGO_BASE_URL}/documents",
@@ -665,6 +694,7 @@ def finalize_billingo_invoice(doc, method=None):
         result = response.json()
 
         _mark_document_synced(doc, result)
+        _send_document_via_billingo(doc, result)
 
     except requests.exceptions.HTTPError as e:
         error_detail = _get_error_text(e.response) if e.response is not None else str(e)
