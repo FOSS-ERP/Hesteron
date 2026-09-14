@@ -148,6 +148,12 @@ def _get_flat_charge_rows(sales_invoice):
 
 
 def _map_extra_charges(sales_invoice):
+    is_hungarian = _get_invoice_language(sales_invoice) == "hu"
+    comment = (
+        "Automatikusan hozzáadva a Sales Invoice adók táblából (tételes díj)"
+        if is_hungarian
+        else "Auto-added from Sales Invoice taxes table (flat charge)"
+    )
     extra_items = []
     for tax_row in _get_flat_charge_rows(sales_invoice):
         extra_items.append({
@@ -157,7 +163,7 @@ def _map_extra_charges(sales_invoice):
             "quantity": 1,
             "unit": "pcs",
             "vat": "0%",
-            "comment": "Auto-added from Sales Invoice taxes table (flat charge)",
+            "comment": comment,
         })
     return extra_items
 
@@ -252,7 +258,7 @@ def _map_payment_method(doc):
     return MODE_OF_PAYMENT_MAP.get(mode_of_payment, DEFAULT_PAYMENT_METHOD)
 
 
-def _build_payment_term_lines(doc):
+def _build_payment_term_lines(doc, is_hungarian=False):
     rows = doc.get("payment_schedule") or []
     lines = []
     for row in rows:
@@ -274,27 +280,38 @@ def _build_payment_term_lines(doc):
         detail = description or term_name
         extras = []
         if row.get("invoice_portion"):
-            extras.append(f"{row.invoice_portion}% due")
+            due_word = "esedékes" if is_hungarian else "due"
+            extras.append(f"{row.invoice_portion}% {due_word}")
         if row.get("due_date"):
-            extras.append(f"by {row.due_date}")
+            by_word = "eddig" if is_hungarian else "by"
+            extras.append(f"{by_word} {row.due_date}")
 
-        line = f"Payment Term: {detail}"
+        term_label = "Fizetési feltétel" if is_hungarian else "Payment Term"
+        line = f"{term_label}: {detail}"
         if extras:
             line += f" ({', '.join(extras)})"
         lines.append(line)
 
         if mode_of_payment:
-            lines.append(f"Mode of Payment: {mode_of_payment}")
+            mode_label = "Fizetési mód" if is_hungarian else "Mode of Payment"
+            lines.append(f"{mode_label}: {mode_of_payment}")
 
     return lines
 
 
 def _build_comment(doc):
-    lines = [f"ERPNext Sales Invoice {doc.name}"]
-    lines.extend(_build_payment_term_lines(doc))
+    is_hungarian = _get_invoice_language(doc) == "hu"
+
+    if is_hungarian:
+        lines = [f"ERPNext Számla {doc.name}"]
+    else:
+        lines = [f"ERPNext Sales Invoice {doc.name}"]
+
+    lines.extend(_build_payment_term_lines(doc, is_hungarian))
 
     if doc.get("shipping_rule"):
-        lines.append(f"Shipping Rule: {doc.shipping_rule}")
+        label = "Szállítási mód" if is_hungarian else "Shipping Rule"
+        lines.append(f"{label}: {doc.shipping_rule}")
 
     if doc.get("incoterm"):
         incoterm_line = f"Incoterm: {doc.incoterm}"
@@ -303,7 +320,7 @@ def _build_comment(doc):
         lines.append(incoterm_line)
 
     if doc.get("tc_name") or doc.get("terms"):
-        lines.append("Terms and Conditions")
+        lines.append("Általános Szerződési Feltételek" if is_hungarian else "Terms and Conditions")
 
     if doc.get("tc_name"):
         lines.append(doc.tc_name)
