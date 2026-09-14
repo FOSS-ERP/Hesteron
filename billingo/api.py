@@ -35,6 +35,16 @@ MODE_OF_PAYMENT_MAP = {
     "Phone": "online_bankcard",
 }
 
+# Billingo bank_account_id values are specific to the Hesteron Kft. live
+# Billingo account (Profil azonosito: 190-191) - do not reuse against the
+# test/sandbox Billingo account, its ids differ. HUF (and any unmapped
+# currency) is intentionally left unset, so Billingo's own account-level
+# default bank account applies (currently BinX HUF, id 284393).
+BANK_ACCOUNT_ID_BY_CURRENCY = {
+    "EUR": 280724,  # Billingo bank account: IbanFirst EUR
+    "USD": 294227,  # Billingo bank account: IbanFirst USD
+}
+
 
 def _get_headers():
     api_key = frappe.conf.get("billingo_api_key")
@@ -160,18 +170,67 @@ def _map_vat_rate(sales_invoice):
     return "0%"
 
 
+def _format_item_name(row):
+    """
+    "ITEMCODE - Item Name" for the Billingo line-item title. Falls back to
+    whichever of code/name is present, and avoids "CODE - CODE" when there's
+    no distinct item_name.
+    """
+    item_code = row.item_code
+    item_name = row.item_name or item_code
+    if item_code and item_code != item_name:
+        return f"{item_code} \u2013 {item_name}"
+    return item_name or item_code
+
+
+def _get_serial_numbers(row):
+    """
+    Serial numbers for one Sales Invoice Item row. ERPNext v15+ has two ways
+    these can be stored, depending on the Item's "Use Serial No / Batch
+    Fields" setting:
+      - legacy / use_serial_batch_fields checked: newline-separated text
+        directly in row.serial_no
+      - current default: a linked "Serial and Batch Bundle" document, whose
+        child rows (doctype "Serial and Batch Entry") each carry one
+        serial_no for this line
+    Check both so this works regardless of which mode Balazs's items use.
+    """
+    if row.get("serial_no"):
+        return [s.strip() for s in row.serial_no.split("\n") if s.strip()]
+
+    bundle = row.get("serial_and_batch_bundle")
+    if not bundle:
+        return []
+
+    return [
+        s for s in frappe.get_all(
+            "Serial and Batch Entry",
+            filters={"parent": bundle},
+            pluck="serial_no",
+        )
+        if s
+    ]
+
+
+def _get_item_comment(row):
+    serial_numbers = _get_serial_numbers(row)
+    if serial_numbers:
+        return "S/N: " + ", ".join(serial_numbers)
+    return ""
+
+
 def _map_items(sales_invoice):
     vat_rate = _map_vat_rate(sales_invoice)
     items = []
     for row in sales_invoice.items:
         items.append({
-            "name": row.item_name or row.item_code,
+            "name": _format_item_name(row),
             "unit_price": row.rate,
             "unit_price_type": "net",
             "quantity": row.qty,
             "unit": row.uom or "pcs",
             "vat": vat_rate,
-            "comment": row.description or "",
+            "comment": _get_item_comment(row),
         })
     items.extend(_map_extra_charges(sales_invoice))
     return items
@@ -260,15 +319,45 @@ def _build_comment(doc):
     return "\n".join(lines)
 
 
+def _get_invoice_language(doc):
+    """
+    Determines which language Billingo should render the invoice in.
+    Driven by the standard ERPNext Customer.language field.
+    Default is Hungarian; only an explicit "en" on the Customer
+    switches the invoice to English.
+    """
+    customer_language = frappe.db.get_value("Customer", doc.customer, "language")
+    if customer_language == "en":
+        return "en"
+    return "hu"
+
+
+def _get_bank_account_id(doc):
+    """
+    Returns the Billingo bank_account_id to attach for non-HUF invoices.
+    HUF (and any other unmapped currency) is left unset, so Billingo's own
+    account-level default bank account applies (currently BinX HUF).
+    """
+    bank_account_id = BANK_ACCOUNT_ID_BY_CURRENCY.get(doc.currency)
+    if not bank_account_id and doc.currency and doc.currency != "HUF":
+        frappe.log_error(
+            f"No Billingo bank_account_id mapped for currency '{doc.currency}' "
+            f"on Sales Invoice {doc.name}. Falling back to the Billingo "
+            f"account-wide default bank account.",
+            "Billingo Bank Account Mapping - Unmapped Currency",
+        )
+    return bank_account_id
+
+
 def _build_billingo_payload(doc, partner_id, doc_type):
-    return {
+    payload = {
         "partner_id": partner_id,
         "block_id": 0,
         "type": doc_type,          # "draft" while ERPNext is Draft, "invoice" on submit
         "fulfillment_date": str(doc.posting_date),
         "due_date": str(doc.due_date or doc.posting_date),
         "payment_method": _map_payment_method(doc),
-        "language": "en",
+        "language": _get_invoice_language(doc),
         "currency": doc.currency or "EUR",
         "conversion_rate": doc.conversion_rate or 1,
         "electronic": False,
@@ -276,6 +365,12 @@ def _build_billingo_payload(doc, partner_id, doc_type):
         "items": _map_items(doc),
         "comment": _build_comment(doc),
     }
+
+    bank_account_id = _get_bank_account_id(doc)
+    if bank_account_id:
+        payload["bank_account_id"] = bank_account_id
+
+    return payload
 
 
 # ----------------------------------------------------------------------
@@ -366,7 +461,7 @@ def finalize_billingo_invoice(doc, method=None):
 
             doc.db_set("custom_billingo_document_id", result.get("id"))
             doc.db_set("custom_billingo_invoice_number", result.get("invoice_number"))
-            doc.db_set("custom_billingo_sync_status", "Invoiced")
+            doc.db_set("custom_billingo_sync_status", "Synced")
             doc.db_set("custom_billingo_error", "")
             return
 
@@ -399,7 +494,7 @@ def finalize_billingo_invoice(doc, method=None):
         result = response.json()
 
         doc.db_set("custom_billingo_invoice_number", result.get("invoice_number"))
-        doc.db_set("custom_billingo_sync_status", "Invoiced")
+        doc.db_set("custom_billingo_sync_status", "Synced")
         doc.db_set("custom_billingo_error", "")
 
     except requests.exceptions.HTTPError as e:
