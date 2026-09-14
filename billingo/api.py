@@ -243,45 +243,88 @@ def _get_customer_email(customer_name):
 # Items / VAT / payment method / comment (unchanged from working version)
 # ----------------------------------------------------------------------
 
-def _get_flat_charge_rows(sales_invoice):
+PERCENTAGE_CHARGE_TYPES = {"On Net Total", "On Previous Row Total", "On Previous Row Amount"}
+
+# Billingo's entitlement values for the zero-rated Hungarian tax templates
+# used by Hesteron. The entitlement is sent alongside vat="0%".
+ZERO_VAT_ENTITLEMENT_BY_TEMPLATE_MARKER = (
+    ("89", "KBAET"),
+    ("export", "EAM"),
+    ("98", "EAM"),
+    ("tam", "TAM"),
+    ("37", "EUFAD37"),
+)
+
+
+def _get_shipping_charge_rows(sales_invoice):
+    """Return only non-zero Actual rows created by the selected Shipping Rule."""
+    if not sales_invoice.get("shipping_rule"):
+        return []
+
+    shipping_account = frappe.db.get_value("Shipping Rule", sales_invoice.shipping_rule, "account")
+    if not shipping_account:
+        frappe.log_error(
+            f"Could not resolve the account for Shipping Rule '{sales_invoice.shipping_rule}' "
+            f"on Sales Invoice {sales_invoice.name}.",
+            "Billingo Shipping Rule Mapping",
+        )
+        return []
+
     return [
         tax_row
         for tax_row in (sales_invoice.get("taxes") or [])
-        if tax_row.charge_type == "Actual" and tax_row.tax_amount
+        if (
+            tax_row.charge_type == "Actual"
+            and tax_row.account_head == shipping_account
+            and tax_row.tax_amount
+        )
     ]
 
 
 def _map_extra_charges(sales_invoice):
     is_hungarian = _get_invoice_language(sales_invoice) == "hu"
-    vat_rate = _map_vat_rate(sales_invoice)
+    vat_treatment = _get_vat_treatment(sales_invoice)
     comment = (
         "Automatikusan hozzáadva a Sales Invoice adók táblából (tételes díj)"
         if is_hungarian
         else "Auto-added from Sales Invoice taxes table (flat charge)"
     )
     extra_items = []
-    for tax_row in _get_flat_charge_rows(sales_invoice):
-        extra_items.append({
+    for tax_row in _get_shipping_charge_rows(sales_invoice):
+        item = {
             "name": tax_row.description or tax_row.account_head or "Additional charge",
             "unit_price": tax_row.tax_amount,
             "unit_price_type": "net",
             "quantity": 1,
             "unit": "pcs",
-            # ERPNext's actual tax rows are commonly used for shipping.
-            # They must use the invoice's VAT rate, not become an exempt
-            # Billingo line item.
-            "vat": vat_rate,
+            "vat": vat_treatment["vat"],
             "comment": comment,
-        })
+        }
+        if vat_treatment["entitlement"]:
+            item["entitlement"] = vat_treatment["entitlement"]
+        extra_items.append(item)
     return extra_items
 
 
-def _map_vat_rate(sales_invoice):
-    percentage_charge_types = {"On Net Total", "On Previous Row Total", "On Previous Row Amount"}
+def _get_vat_treatment(sales_invoice):
+    """Resolve the one Billingo VAT/entitlement treatment used by all lines."""
     for tax_row in sales_invoice.get("taxes") or []:
-        if tax_row.charge_type in percentage_charge_types and tax_row.rate:
-            return f"{int(tax_row.rate)}%"
-    return "0%"
+        if tax_row.charge_type in PERCENTAGE_CHARGE_TYPES:
+            if tax_row.rate:
+                return {"vat": f"{int(tax_row.rate)}%", "entitlement": None}
+            break
+
+    template_name = (sales_invoice.get("taxes_and_charges") or "").casefold()
+    for marker, entitlement in ZERO_VAT_ENTITLEMENT_BY_TEMPLATE_MARKER:
+        if marker in template_name:
+            return {"vat": "0%", "entitlement": entitlement}
+
+    frappe.log_error(
+        f"No percentage VAT row or known zero-VAT entitlement was found for Sales Invoice "
+        f"{sales_invoice.name}. Sending Billingo VAT as 0% without an entitlement.",
+        "Billingo VAT Mapping",
+    )
+    return {"vat": "0%", "entitlement": None}
 
 
 def _format_item_name(row):
@@ -334,18 +377,21 @@ def _get_item_comment(row):
 
 
 def _map_items(sales_invoice):
-    vat_rate = _map_vat_rate(sales_invoice)
+    vat_treatment = _get_vat_treatment(sales_invoice)
     items = []
     for row in sales_invoice.items:
-        items.append({
+        item = {
             "name": _format_item_name(row),
             "unit_price": row.rate,
             "unit_price_type": "net",
             "quantity": row.qty,
             "unit": row.uom or "pcs",
-            "vat": vat_rate,
+            "vat": vat_treatment["vat"],
             "comment": _get_item_comment(row),
-        })
+        }
+        if vat_treatment["entitlement"]:
+            item["entitlement"] = vat_treatment["entitlement"]
+        items.append(item)
     items.extend(_map_extra_charges(sales_invoice))
     return items
 
