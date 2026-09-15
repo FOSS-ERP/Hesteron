@@ -231,6 +231,12 @@ def _get_customer_address(customer_name):
 
 
 def _get_customer_email(customer_name):
+    primary_contact = frappe.db.get_value("Customer", customer_name, "customer_primary_contact")
+    if primary_contact:
+        primary_email = frappe.db.get_value("Contact", primary_contact, "email_id")
+        if primary_email:
+            return primary_email
+
     contact_name = frappe.db.get_value(
         "Dynamic Link",
         {"link_doctype": "Customer", "link_name": customer_name, "parenttype": "Contact"},
