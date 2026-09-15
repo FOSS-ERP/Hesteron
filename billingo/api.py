@@ -38,13 +38,13 @@ MODE_OF_PAYMENT_MAP = {
     "Phone": "online_bankcard",
 }
 
-# Billingo bank_account_id values are specific to the Hesteron Kft. live
-# Billingo account (Profil azonosito: 190-191) - do not reuse against the
-# test/sandbox Billingo account, its IDs differ.
-BANK_ACCOUNT_ID_BY_CURRENCY = {
-    "HUF": 284393,  # Billingo bank account: BinX HUF
-    "EUR": 280724,  # Billingo bank account: IbanFirst EUR
-    "USD": 294227,  # Billingo bank account: IbanFirst USD
+# Bank-account IDs are profile scoped in Billingo and must never be copied
+# between the live and test profiles. These fragments identify Hesteron's
+# intended accounts when resolving them from the active profile.
+PREFERRED_BANK_ACCOUNT_FRAGMENT_BY_CURRENCY = {
+    "HUF": "30400001-00000000-66470940",  # BinX HUF
+    "EUR": "914098808656",  # IBANFIRST EUR
+    "USD": "914098809060",  # IBANFIRST USD
 }
 
 # This is deliberately a site setting, rather than a source-code constant:
@@ -507,21 +507,64 @@ def _get_invoice_language(doc):
     return DEFAULT_DOCUMENT_LANGUAGE
 
 
+def _get_billingo_bank_accounts():
+    response = requests.get(
+        f"{BILLINGO_BASE_URL}/bank-accounts",
+        params={"per_page": 100},
+        headers=_get_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("data", [])
+
+
 def _get_bank_account_id(doc):
-    """
-    Returns the Billingo bank_account_id to attach for non-HUF invoices.
-    HUF, EUR and USD use the Hesteron live-account bank accounts selected by
-    the business. Any other currency falls back to Billingo's account default.
-    """
-    bank_account_id = BANK_ACCOUNT_ID_BY_CURRENCY.get(doc.currency)
-    if not bank_account_id and doc.currency and doc.currency != "HUF":
-        frappe.log_error(
-            f"No Billingo bank_account_id mapped for currency '{doc.currency}' "
-            f"on Sales Invoice {doc.name}. Falling back to the Billingo "
-            f"account-wide default bank account.",
-            "Billingo Bank Account Mapping - Unmapped Currency",
+    """Resolve a bank account from the API key's active Billingo profile."""
+    currency = (doc.currency or "").upper()
+    if not currency:
+        return None
+
+    accounts = _get_billingo_bank_accounts()
+    config_key = f"billingo_bank_account_id_{currency.lower()}"
+    configured_id = frappe.conf.get(config_key)
+
+    if configured_id not in (None, ""):
+        try:
+            configured_id = int(configured_id)
+        except (TypeError, ValueError):
+            frappe.throw(f"{config_key} must be a positive integer.")
+
+        if any(account.get("id") == configured_id for account in accounts):
+            return configured_id
+        frappe.throw(
+            f"{config_key} ({configured_id}) is not available to the current Billingo API key. "
+            "Update the site config or use an API key from the correct Billingo profile."
         )
-    return bank_account_id
+
+    accounts_for_currency = [account for account in accounts if account.get("currency") == currency]
+    preferred_fragment = PREFERRED_BANK_ACCOUNT_FRAGMENT_BY_CURRENCY.get(currency)
+    preferred_accounts = [
+        account
+        for account in accounts_for_currency
+        if preferred_fragment
+        and preferred_fragment in (account.get("account_number") or "").replace(" ", "")
+    ]
+    if len(preferred_accounts) == 1:
+        return preferred_accounts[0]["id"]
+
+    if len(accounts_for_currency) == 1:
+        return accounts_for_currency[0]["id"]
+
+    if not accounts_for_currency:
+        frappe.throw(
+            f"No Billingo bank account for {currency} is available to the current API key. "
+            "Add the account in the active Billingo profile before submitting this invoice."
+        )
+
+    frappe.throw(
+        f"More than one Billingo bank account is available for {currency}; set {config_key} "
+        "in Site Config to the required account ID."
+    )
 
 
 def _build_billingo_payload(doc, partner_id, doc_type):
