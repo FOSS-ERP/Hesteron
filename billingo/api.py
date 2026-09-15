@@ -631,15 +631,19 @@ def _mark_document_synced(doc, result):
     doc.db_set("custom_billingo_error", "")
 
 
-def _send_document_via_billingo(doc, result):
+def _send_document_via_billingo(doc, result, raise_on_error=False):
     """Ask Billingo to email a finalized document to the ERPNext contact."""
     document_id = result.get("id")
     email = _get_customer_email(doc.customer)
     if not document_id or not email:
-        frappe.throw(
+        message = (
             f"Billingo delivery cannot be completed for Sales Invoice {doc.name}: "
             "the Customer needs a linked Contact with an email address."
         )
+        if raise_on_error:
+            frappe.throw(message)
+        frappe.log_error(message, "Billingo Send Skipped")
+        return None
         return
 
     try:
@@ -650,11 +654,18 @@ def _send_document_via_billingo(doc, result):
             timeout=20,
         )
         response.raise_for_status()
+        return response.json()
     except requests.exceptions.HTTPError as e:
         error_detail = _get_error_text(e.response) if e.response is not None else str(e)
         frappe.log_error(error_detail, "Billingo Send Error")
+        if raise_on_error:
+            frappe.throw(f"Billingo delivery failed: {error_detail}")
     except Exception:
-        frappe.log_error(frappe.get_traceback(), "Billingo Send Error")
+        error_detail = frappe.get_traceback()
+        frappe.log_error(error_detail, "Billingo Send Error")
+        if raise_on_error:
+            frappe.throw("Billingo delivery failed. Check the Error Log for details.")
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -819,3 +830,26 @@ def retry_billingo_sync(sales_invoice: str) -> dict:
         "document_id": doc.get("custom_billingo_document_id"),
         "invoice_number": doc.get("custom_billingo_invoice_number"),
     }
+
+
+@frappe.whitelist()
+def send_billingo_invoice(sales_invoice: str) -> dict:
+    """Send an already-issued Billingo invoice to the linked Customer Contact."""
+    doc = frappe.get_doc("Sales Invoice", sales_invoice)
+    doc.check_permission("write")
+
+    if doc.docstatus != 1:
+        frappe.throw("Only submitted Sales Invoices can be sent through Billingo.")
+    if not doc.get("custom_billingo_document_id"):
+        frappe.throw("This Sales Invoice has no Billingo document ID.")
+
+    email = _get_customer_email(doc.customer)
+    if not email:
+        frappe.throw(
+            f"Customer '{doc.customer}' needs a linked Contact with an email address before sending."
+        )
+
+    _send_document_via_billingo(
+        doc, {"id": doc.custom_billingo_document_id}, raise_on_error=True
+    )
+    return {"email": email, "invoice_number": doc.get("custom_billingo_invoice_number")}
