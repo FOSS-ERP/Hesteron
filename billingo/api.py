@@ -231,12 +231,14 @@ def _get_customer_address(customer_name):
 
 
 def _get_customer_email(customer_name):
-    email = frappe.db.get_value(
-        "Contact",
-        {"links.link_doctype": "Customer", "links.link_name": customer_name},
-        "email_id",
+    contact_name = frappe.db.get_value(
+        "Dynamic Link",
+        {"link_doctype": "Customer", "link_name": customer_name, "parenttype": "Contact"},
+        "parent",
     )
-    return email or ""
+    if not contact_name:
+        return ""
+    return frappe.db.get_value("Contact", contact_name, "email_id") or ""
 
 
 # ----------------------------------------------------------------------
@@ -634,10 +636,9 @@ def _send_document_via_billingo(doc, result):
     document_id = result.get("id")
     email = _get_customer_email(doc.customer)
     if not document_id or not email:
-        frappe.log_error(
-            f"Billingo document {document_id or '(unknown)'} for Sales Invoice {doc.name} "
-            "was finalized but not sent: the Customer has no linked contact email.",
-            "Billingo Send Skipped",
+        frappe.throw(
+            f"Billingo delivery cannot be completed for Sales Invoice {doc.name}: "
+            "the Customer needs a linked Contact with an email address."
         )
         return
 
@@ -726,6 +727,15 @@ def finalize_billingo_invoice(doc, method=None):
     Converts the existing Billingo draft into a real invoice in place.
     """
     try:
+        # Billingo delivery needs an explicit recipient in its separate /send
+        # request. Validate first so the document is never finalized with
+        # "No sending" selected due to a missing recipient.
+        if not _get_customer_email(doc.customer):
+            frappe.throw(
+                f"Cannot submit Sales Invoice {doc.name}: Customer '{doc.customer}' needs a "
+                "linked Contact with an email address for Billingo delivery."
+            )
+
         if doc.is_return:
             original_billingo_id = frappe.db.get_value(
                 "Sales Invoice", doc.return_against, "custom_billingo_document_id"
